@@ -1,0 +1,2 @@
+/Users/neteshpaudel/Projects/flutter_background_remover/example/android/app/.cxx/Debug/154ge4qy/armeabi-v7a/CMakeFiles/edit_cache.dir
+/Users/neteshpaudel/Projects/flutter_background_remover/example/android/app/.cxx/Debug/154ge4qy/armeabi-v7a/CMakeFiles/rebuild_cache.dir

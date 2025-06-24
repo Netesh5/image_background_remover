@@ -118,6 +118,10 @@ class BackgroundRemover {
     if (outputTensor is List) {
       final mask = outputTensor[0][0];
 
+      outputTensor.forEach((tensor) {
+        tensor.release();
+      });
+
       /// Generate and refine the mask
       final resizedMask = smoothMask
           ? resizeMaskBilinear(mask, originalImage.width, originalImage.height)
@@ -408,5 +412,6 @@ class BackgroundRemover {
   void dispose() {
     _session?.release();
     _session = null;
+    OrtEnv.instance.release();
   }
 }

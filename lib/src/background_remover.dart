@@ -93,6 +93,8 @@ class BackgroundRemover {
       throw Exception("ONNX session not initialized");
     }
 
+    final ui.Image result;
+
     /// Decode the input image
     final originalImage = await decodeImageFromList(imageBytes);
     log('Original image size: ${originalImage.width}x${originalImage.height}');
@@ -118,10 +120,6 @@ class BackgroundRemover {
     if (outputTensor is List) {
       final mask = outputTensor[0][0];
 
-      outputTensor.forEach((tensor) {
-        tensor.release();
-      });
-
       /// Generate and refine the mask
       final resizedMask = smoothMask
           ? resizeMaskBilinear(mask, originalImage.width, originalImage.height)
@@ -133,11 +131,21 @@ class BackgroundRemover {
           : resizedMask;
 
       /// Apply the mask to the original image
-      return await _applyMaskToOriginalSizeImage(originalImage, finalMask,
+      result = await _applyMaskToOriginalSizeImage(originalImage, finalMask,
           threshold: threshold, smooth: smoothMask);
     } else {
       throw Exception('Unexpected output format from ONNX model.');
     }
+
+    /// Release the ONNX session resources
+    outputs?.forEach((output) {
+      output?.release();
+    });
+
+    originalImage.dispose();
+    resizedImage.dispose();
+
+    return result;
   }
 
   /// Resizes the input image to the specified dimensions.

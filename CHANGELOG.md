@@ -1,3 +1,8 @@
+## 2.0.1
+
+### Fix
+- **Bounded memory use during mask compositing.** `removeBg`/`removeBgBytes` previously held the full-resolution decoded source image through the entire RGBA decode/mask-apply/encode pipeline. For typical 12MP+ camera photos this could hold 2-3 full-resolution buffers in memory at once, causing out-of-memory crashes on release builds and mid/low-RAM devices (the model itself only ever used a 320x320 copy). Added `BackgroundRemover.instance.maxWorkingDimension` (default `1600`) — source images with a longest side above this are downscaled, preserving aspect ratio, before mask compositing.
+
 ## 2.0.0
 
 ### 🎉 Major Update: Migration to flutter_onnxruntime

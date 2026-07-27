@@ -25,6 +25,15 @@ class BackgroundRemover {
   /// Model input/output size
   int modelSize = 320;
 
+  /// Maximum dimension (longest side, in pixels) used when compositing the
+  /// mask back onto the image. Full-resolution camera photos (12MP+) held
+  /// through the whole RGBA decode/mask/encode pipeline are a common
+  /// out-of-memory crash on release builds and mid/low-RAM devices, even
+  /// though the model itself only ever sees a [modelSize]x[modelSize] copy.
+  /// Images larger than this are downscaled (preserving aspect ratio) before
+  /// mask compositing.
+  int maxWorkingDimension = 1600;
+
   /// Initializes the ONNX environment and creates a session.
   ///
   /// This method should be called once before using the [removeBg] method.
@@ -72,8 +81,24 @@ class BackgroundRemover {
     log('Original image size: ${originalImage.width}x${originalImage.height}',
         name: "BackgroundRemover");
 
+    /// Downscale before compositing if the source exceeds the working cap.
+    /// This bounds peak memory to ~maxWorkingDimension^2 instead of the raw
+    /// camera resolution, regardless of how large the input photo is.
+    ui.Image workingImage = originalImage;
+    final longestSide = originalImage.width > originalImage.height
+        ? originalImage.width
+        : originalImage.height;
+    if (longestSide > maxWorkingDimension) {
+      final scale = maxWorkingDimension / longestSide;
+      final workingWidth = (originalImage.width * scale).round();
+      final workingHeight = (originalImage.height * scale).round();
+      workingImage = await ImageProcessor.resizeImage(
+          originalImage, workingWidth, workingHeight);
+      originalImage.dispose();
+    }
+
     final resizedImage =
-        await ImageProcessor.resizeImage(originalImage, modelSize, modelSize);
+        await ImageProcessor.resizeImage(workingImage, modelSize, modelSize);
 
     /// Convert the resized image into a tensor format required by the ONNX model
     final rgbFloats = await ImageProcessor.imageToFloatTensor(resizedImage);
@@ -109,19 +134,19 @@ class BackgroundRemover {
     /// Generate and refine the mask
     final resizedMask = smoothMask
         ? MaskProcessor.resizeMaskBilinear(
-            mask, originalImage.width, originalImage.height)
+            mask, workingImage.width, workingImage.height)
         : MaskProcessor.resizeMaskNearest(
-            mask, originalImage.width, originalImage.height,
+            mask, workingImage.width, workingImage.height,
             maskSize: modelSize);
 
     /// Apply edge enhancement if requested
     final finalMask = enhanceEdges
-        ? await MaskProcessor.enhanceMaskEdges(originalImage, resizedMask)
+        ? await MaskProcessor.enhanceMaskEdges(workingImage, resizedMask)
         : resizedMask;
 
-    /// Apply the mask to the original image
+    /// Apply the mask to the (possibly downscaled) working image
     final result = await ImageProcessor.applyMaskToImage(
-      originalImage,
+      workingImage,
       finalMask,
       threshold: threshold,
       smooth: smoothMask,
@@ -131,7 +156,7 @@ class BackgroundRemover {
     await outputTensor.dispose();
 
     /// Clean up intermediate images
-    originalImage.dispose();
+    workingImage.dispose();
     resizedImage.dispose();
 
     return result;

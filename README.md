@@ -265,6 +265,34 @@ For the package to work correctly on iOS, you need to configure your iOS project
 </details>
 
 
+## ⛔️ Android Setup
+
+### Required Android Configuration
+
+For the package to work correctly on Android, you need to configure your Android project ([reference](https://onnxruntime.ai/docs/build/android.html#note-proguard-rules-for-r8-minimization-android-app-builds-to-work)):
+
+1. **Update your build config** (`android/app/build.gradle.kts`):
+   ```kotlin
+   isMinifyEnabled = true
+   isShrinkResources = true
+   proguardFiles(
+       getDefaultProguardFile("proguard-android-optimize.txt"),
+       "proguard-rules.pro"
+   )
+   ```
+
+2. **Update/add your ProGuard rules** (`android/app/proguard-rules.pro`):
+   ```
+   -keep class ai.onnxruntime.** { *; }
+   ```
+
+## 📋 More Troubleshooting
+
+`image_background_remover` is built on top of [`flutter_onnxruntime`](https://pub.dev/packages/flutter_onnxruntime), which maintains its own troubleshooting guide covering platform-specific issues. You can read it [here](https://github.com/masicai/flutter_onnxruntime/blob/main/doc/troubleshooting.md).
+
+If you run into an error, it's worth checking that guide as well.
+
+
 ## ⚠️ Warning
 
 This package uses an offline model to process images, which is bundled with the application. **This may increase the size of your app**. 

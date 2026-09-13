@@ -37,10 +37,6 @@ dependencies:
   image_picker: ^1.1.2
   image_background_remover:
     path: ../
-  # image_background_remover:
-  #   git:
-  #     url: https://github.com/mozhaiskyi/image_background_remover
-  #     branch: main
 
 dev_dependencies:
   flutter_test:

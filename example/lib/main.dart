@@ -42,6 +42,10 @@ class _MyHomePageState extends State<MyHomePage> {
 
   @override
   void dispose() {
+    // Note: Since dispose is synchronous, we can't await here.
+    // The session will be cleaned up by the garbage collector if not explicitly closed.
+    // For proper cleanup, consider calling BackgroundRemover.instance.dispose()
+    // in a place where async is supported, such as before app termination.
     BackgroundRemover.instance.dispose();
     super.dispose();
   }

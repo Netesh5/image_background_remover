@@ -1,14 +1,17 @@
 import 'dart:async';
 import 'dart:developer';
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
-import 'package:image_background_remover/assets.dart';
-import 'package:onnxruntime/onnxruntime.dart';
-import 'package:image/image.dart' as img;
+import 'package:flutter_onnxruntime/flutter_onnxruntime.dart';
+import 'package:image_background_remover/src/services/onnx_session_manager.dart';
+import 'package:image_background_remover/src/utils/background_composer.dart';
+import 'package:image_background_remover/src/utils/image_processor.dart';
+import 'package:image_background_remover/src/utils/mask_processor.dart';
 
+/// Main class for background removal functionality
 class BackgroundRemover {
   BackgroundRemover._internal();
 
@@ -16,52 +19,30 @@ class BackgroundRemover {
 
   static BackgroundRemover get instance => _instance;
 
-  // The ONNX session used for inference.
-  OrtSession? _session;
+  /// Session manager for ONNX Runtime
+  final OnnxSessionManager _sessionManager = OnnxSessionManager();
 
-  // ImageNet mean and standard deviation for normalization
-  final List<double> _mean = [0.485, 0.456, 0.406];
-  final List<double> _std = [0.229, 0.224, 0.225];
-
+  /// Model input/output size
   int modelSize = 320;
+
+  /// Maximum dimension (longest side, in pixels) used when compositing the
+  /// mask back onto the image. Full-resolution camera photos (12MP+) held
+  /// through the whole RGBA decode/mask/encode pipeline are a common
+  /// out-of-memory crash on release builds and mid/low-RAM devices, even
+  /// though the model itself only ever sees a [modelSize]x[modelSize] copy.
+  /// Images larger than this are downscaled (preserving aspect ratio) before
+  /// mask compositing.
+  int maxWorkingDimension = 1600;
 
   /// Initializes the ONNX environment and creates a session.
   ///
   /// This method should be called once before using the [removeBg] method.
   Future<void> initializeOrt() async {
     try {
-      /// Initialize the ONNX runtime environment.
-      OrtEnv.instance.init();
-
-      /// Create the ONNX session.
-      await _createSession();
+      await _sessionManager.initialize();
     } catch (e) {
-      log(e.toString());
-    }
-  }
-
-  /// Creates an ONNX session using the model from assets.
-  Future<void> _createSession() async {
-    try {
-      /// Session configuration options.
-      final sessionOptions = OrtSessionOptions();
-
-      /// Load the model as a raw asset.
-      final rawAssetFile = await rootBundle.load(Assets.modelPath);
-
-      /// Convert the asset to a byte array.
-      final bytes = rawAssetFile.buffer.asUint8List();
-
-      /// Create the ONNX session.
-      _session = OrtSession.fromBuffer(bytes, sessionOptions);
-      sessionOptions.release();
-      if (kDebugMode) {
-        log('ONNX session created successfully.', name: "BackgroundRemover");
-      }
-    } catch (e) {
-      if (kDebugMode) {
-        log('Error creating ONNX session: $e', name: "BackgroundRemover");
-      }
+      log('Failed to initialize ONNX session: $e', name: "BackgroundRemover");
+      rethrow;
     }
   }
 
@@ -73,12 +54,13 @@ class BackgroundRemover {
   /// - [imageBytes]: The input image as a byte array.
   /// - [threshold]: The threshold value for foreground/background separation (default: 0.5).
   /// - [smoothMask]: Whether to apply smoothing to the output mask (default: true).
+  /// - [enhanceEdges]: Whether to enhance mask edges using image gradients (default: true).
   /// - Returns: A [ui.Image] with the background removed.
   ///
   /// Example usage:
   /// ```dart
   /// final imageBytes = await File('path_to_image').readAsBytes();
-  /// final ui.Image imageWithoutBackground = await removeBackground(imageBytes);
+  /// final ui.Image imageWithoutBackground = await BackgroundRemover.instance.removeBg(imageBytes);
   /// ```
   ///
   /// Note: This function may take some time to process depending on the size
@@ -89,303 +71,145 @@ class BackgroundRemover {
     bool smoothMask = true,
     bool enhanceEdges = true,
   }) async {
-    if (_session == null) {
-      throw Exception("ONNX session not initialized");
+    if (!_sessionManager.isInitialized) {
+      throw Exception(
+          "ONNX session not initialized. Call initializeOrt() first.");
     }
-
-    final ui.Image result;
 
     /// Decode the input image
     final originalImage = await decodeImageFromList(imageBytes);
-    log('Original image size: ${originalImage.width}x${originalImage.height}');
+    log('Original image size: ${originalImage.width}x${originalImage.height}',
+        name: "BackgroundRemover");
 
-    final resizedImage = await _resizeImage(originalImage, 320, modelSize);
+    /// Downscale before compositing if the source exceeds the working cap.
+    /// This bounds peak memory to ~maxWorkingDimension^2 instead of the raw
+    /// camera resolution, regardless of how large the input photo is.
+    ui.Image workingImage = originalImage;
+    final longestSide = originalImage.width > originalImage.height
+        ? originalImage.width
+        : originalImage.height;
+    if (longestSide > maxWorkingDimension) {
+      final scale = maxWorkingDimension / longestSide;
+      final workingWidth = (originalImage.width * scale).round();
+      final workingHeight = (originalImage.height * scale).round();
+      workingImage = await ImageProcessor.resizeImage(
+          originalImage, workingWidth, workingHeight);
+      originalImage.dispose();
+    }
 
-    /// Convert the resized image into a tensor format required by the ONNX model.
-    final rgbFloats = await _imageToFloatTensor(resizedImage);
-    final inputTensor = OrtValueTensor.createTensorWithDataList(
+    final resizedImage =
+        await ImageProcessor.resizeImage(workingImage, modelSize, modelSize);
+
+    /// Convert the resized image into a tensor format required by the ONNX model
+    final rgbFloats = await ImageProcessor.imageToFloatTensor(resizedImage);
+
+    /// Migration: Changed from OrtValueTensor.createTensorWithDataList to OrtValue.fromList
+    final inputTensor = await OrtValue.fromList(
       Float32List.fromList(rgbFloats),
       [1, 3, modelSize, modelSize],
     );
 
-    /// Prepare the inputs and run inference on the ONNX model.
+    /// Prepare the inputs and run inference on the ONNX model
     final inputs = {'input.1': inputTensor};
-    final runOptions = OrtRunOptions();
-    final outputs = await _session!.runAsync(runOptions, inputs);
-    inputTensor.release();
-    runOptions.release();
 
-    /// Process the output tensor and generate the final image with the background removed.
-    final outputTensor = outputs?[0]?.value;
-    if (outputTensor is List) {
-      final mask = outputTensor[0][0];
+    /// Migration: Simplified to use run() instead of runAsync() with OrtRunOptions
+    final outputs = await _sessionManager.session!.run(inputs);
 
-      /// Generate and refine the mask
-      final resizedMask = smoothMask
-          ? resizeMaskBilinear(mask, originalImage.width, originalImage.height)
-          : resizeMaskNearest(mask, originalImage.width, originalImage.height);
+    /// Migration: Proper tensor disposal for memory management
+    await inputTensor.dispose();
 
-      /// Apply edge enhancement if requested
-      final finalMask = enhanceEdges
-          ? await _enhanceMaskEdges(originalImage, resizedMask)
-          : resizedMask;
+    /// Process the output tensor and generate the final image with the background removed
+    /// Migration: Access outputs using named output instead of indexed access
+    final outputName = _sessionManager.session!.outputNames.first;
+    final outputTensor = outputs[outputName];
 
-      /// Apply the mask to the original image
-      result = await _applyMaskToOriginalSizeImage(originalImage, finalMask,
-          threshold: threshold, smooth: smoothMask);
-    } else {
+    if (outputTensor == null) {
       throw Exception('Unexpected output format from ONNX model.');
     }
 
-    /// Release the ONNX session resources
-    outputs?.forEach((output) {
-      output?.release();
-    });
+    /// Migration: Use asList() to get data with proper shape preservation
+    final outputData = await outputTensor.asList();
+    final mask = outputData[0][0];
 
-    originalImage.dispose();
+    /// Generate and refine the mask
+    final resizedMask = smoothMask
+        ? MaskProcessor.resizeMaskBilinear(
+            mask, workingImage.width, workingImage.height)
+        : MaskProcessor.resizeMaskNearest(
+            mask, workingImage.width, workingImage.height,
+            maskSize: modelSize);
+
+    /// Apply edge enhancement if requested
+    final finalMask = enhanceEdges
+        ? await MaskProcessor.enhanceMaskEdges(workingImage, resizedMask)
+        : resizedMask;
+
+    /// Apply the mask to the (possibly downscaled) working image
+    final result = await ImageProcessor.applyMaskToImage(
+      workingImage,
+      finalMask,
+      threshold: threshold,
+      smooth: smoothMask,
+    );
+
+    /// Migration: Dispose output tensor to free native resources
+    await outputTensor.dispose();
+
+    /// Clean up intermediate images
+    workingImage.dispose();
     resizedImage.dispose();
 
     return result;
   }
 
-  /// Resizes the input image to the specified dimensions.
-  Future<ui.Image> _resizeImage(
-      ui.Image image, int targetWidth, int targetHeight) async {
-    final recorder = ui.PictureRecorder();
-    final canvas = Canvas(recorder);
-    final paint = Paint()..filterQuality = FilterQuality.high;
-
-    final srcRect =
-        Rect.fromLTWH(0, 0, image.width.toDouble(), image.height.toDouble());
-    final dstRect =
-        Rect.fromLTWH(0, 0, targetWidth.toDouble(), targetHeight.toDouble());
-    canvas.drawImageRect(image, srcRect, dstRect, paint);
-
-    final picture = recorder.endRecording();
-    return picture.toImage(targetWidth, targetHeight);
-  }
-
-  /// Resizes the mask using nearest neighbor interpolation.
-  List resizeMaskNearest(List mask, int originalWidth, int originalHeight) {
-    final resizedMask = List.generate(
-      originalHeight,
-      (_) => List.filled(originalWidth, 0.0),
+  /// Removes the background from an image and returns PNG bytes (isolate-compatible).
+  ///
+  /// This function is designed to work with Dart isolates. Unlike [removeBg],
+  /// it returns PNG-encoded bytes instead of a ui.Image, making it safe to use
+  /// with Isolate.run() or compute().
+  ///
+  /// - [imageBytes]: The input image as a byte array.
+  /// - [threshold]: The threshold value for foreground/background separation (default: 0.5).
+  /// - [smoothMask]: Whether to apply smoothing to the output mask (default: true).
+  /// - [enhanceEdges]: Whether to enhance mask edges using image gradients (default: true).
+  /// - Returns: PNG-encoded bytes with the background removed.
+  ///
+  /// Example usage with isolate:
+  /// ```dart
+  /// final imageBytes = await File('path_to_image').readAsBytes();
+  /// final resultBytes = await Isolate.run(() async {
+  ///   await BackgroundRemover.instance.initializeOrt();
+  ///   return await BackgroundRemover.instance.removeBgBytes(imageBytes);
+  /// });
+  /// // Convert to ui.Image if needed
+  /// final image = await decodeImageFromList(resultBytes);
+  /// ```
+  ///
+  /// Note: When using in an isolate, you must call [initializeOrt] within the isolate.
+  Future<Uint8List> removeBgBytes(
+    Uint8List imageBytes, {
+    double threshold = 0.5,
+    bool smoothMask = true,
+    bool enhanceEdges = true,
+  }) async {
+    // Process the image
+    final resultImage = await removeBg(
+      imageBytes,
+      threshold: threshold,
+      smoothMask: smoothMask,
+      enhanceEdges: enhanceEdges,
     );
 
-    for (int y = 0; y < originalHeight; y++) {
-      for (int x = 0; x < originalWidth; x++) {
-        final scaledX = x * 320 ~/ originalWidth;
-        final scaledY = y * 320 ~/ originalHeight;
-        resizedMask[y][x] = mask[scaledY][scaledX];
-      }
-    }
-    return resizedMask;
-  }
-
-  /// Resizes the mask using bilinear interpolation for smoother edges.
-  List resizeMaskBilinear(List mask, int originalWidth, int originalHeight) {
-    final resizedMask = List.generate(
-      originalHeight,
-      (_) => List.filled(originalWidth, 0.0),
-    );
-
-    final maskHeight = mask.length;
-    final maskWidth = mask[0].length;
-
-    for (int y = 0; y < originalHeight; y++) {
-      for (int x = 0; x < originalWidth; x++) {
-        // Map to floating point coordinates in the source mask
-        final srcX = x * maskWidth / originalWidth;
-        final srcY = y * maskHeight / originalHeight;
-
-        // Get integer coordinates for the four surrounding pixels
-        final x1 = srcX.floor();
-        final y1 = srcY.floor();
-        final x2 = (x1 + 1).clamp(0, maskWidth - 1);
-        final y2 = (y1 + 1).clamp(0, maskHeight - 1);
-
-        // Calculate interpolation weights
-        final wx = srcX - x1;
-        final wy = srcY - y1;
-
-        // Perform bilinear interpolation
-        resizedMask[y][x] = mask[y1][x1] * (1 - wx) * (1 - wy) +
-            mask[y1][x2] * wx * (1 - wy) +
-            mask[y2][x1] * (1 - wx) * wy +
-            mask[y2][x2] * wx * wy;
-      }
-    }
-    return resizedMask;
-  }
-
-  /// Converts an image into a floating-point tensor with proper normalization.
-  Future<List<double>> _imageToFloatTensor(ui.Image image) async {
-    final byteData = await image.toByteData(format: ui.ImageByteFormat.rawRgba);
-    if (byteData == null) throw Exception("Failed to get image ByteData");
-    final rgbaBytes = byteData.buffer.asUint8List();
-    final pixelCount = image.width * image.height;
-    final floats = List<double>.filled(pixelCount * 3, 0);
-
-    /// Extract and normalize RGB channels with ImageNet mean/std.
-    for (int i = 0; i < pixelCount; i++) {
-      floats[i] = (rgbaBytes[i * 4] / 255.0 - _mean[0]) / _std[0]; // Red
-      floats[pixelCount + i] =
-          (rgbaBytes[i * 4 + 1] / 255.0 - _mean[1]) / _std[1]; // Green
-      floats[2 * pixelCount + i] =
-          (rgbaBytes[i * 4 + 2] / 255.0 - _mean[2]) / _std[2]; // Blue
-    }
-    return floats;
-  }
-
-  /// Enhances mask edges using image gradients.
-  Future<List> _enhanceMaskEdges(ui.Image originalImage, List mask) async {
+    // Convert ui.Image to PNG bytes
     final byteData =
-        await originalImage.toByteData(format: ui.ImageByteFormat.rawRgba);
-    if (byteData == null) throw Exception("Failed to get image ByteData");
-    final rgbaBytes = byteData.buffer.asUint8List();
+        await resultImage.toByteData(format: ui.ImageByteFormat.png);
+    resultImage.dispose();
 
-    final width = originalImage.width;
-    final height = originalImage.height;
-    final enhancedMask = List.generate(
-      height,
-      (y) => List.generate(width, (x) => mask[y][x]),
-    );
-
-    // Calculate image gradients (simple Sobel-like edge detection)
-    for (int y = 1; y < height - 1; y++) {
-      for (int x = 1; x < width - 1; x++) {
-        // Calculate gradient magnitude using adjacent pixels
-        // final idx = (y * width + x) * 4;
-        final idxLeft = (y * width + (x - 1)) * 4;
-        final idxRight = (y * width + (x + 1)) * 4;
-        final idxUp = ((y - 1) * width + x) * 4;
-        final idxDown = ((y + 1) * width + x) * 4;
-
-        // Calculate gradient for each channel (R,G,B)
-        final gradR = (rgbaBytes[idxRight] - rgbaBytes[idxLeft]).abs() +
-            (rgbaBytes[idxDown] - rgbaBytes[idxUp]).abs();
-        final gradG = (rgbaBytes[idxRight + 1] - rgbaBytes[idxLeft + 1]).abs() +
-            (rgbaBytes[idxDown + 1] - rgbaBytes[idxUp + 1]).abs();
-        final gradB = (rgbaBytes[idxRight + 2] - rgbaBytes[idxLeft + 2]).abs() +
-            (rgbaBytes[idxDown + 2] - rgbaBytes[idxUp + 2]).abs();
-
-        // Average gradient across channels
-        final gradMagnitude = (gradR + gradG + gradB) / 3.0;
-
-        // High gradient (edge) should sharpen the mask boundary
-        if (gradMagnitude > 30) {
-          // Threshold can be adjusted
-          // If we're in a transition area (mask value between 0.3-0.7)
-          if (mask[y][x] > 0.3 && mask[y][x] < 0.7) {
-            // Push values closer to 0 or 1 based on neighbors
-            double sum = 0;
-            int count = 0;
-            for (int ny = y - 1; ny <= y + 1; ny++) {
-              for (int nx = x - 1; nx <= x + 1; nx++) {
-                if (ny >= 0 && ny < height && nx >= 0 && nx < width) {
-                  sum += mask[ny][nx];
-                  count++;
-                }
-              }
-            }
-            final avg = sum / count;
-            // Strengthen the decision at edges
-            enhancedMask[y][x] = avg > 0.5
-                ? (mask[y][x] + 0.1).clamp(0.0, 1.0)
-                : (mask[y][x] - 0.1).clamp(0.0, 1.0);
-          }
-        }
-      }
+    if (byteData == null) {
+      throw Exception('Failed to convert image to bytes');
     }
 
-    return enhancedMask;
-  }
-
-  /// Applies the mask to the original image with configurable threshold and smoothing.
-  Future<ui.Image> _applyMaskToOriginalSizeImage(ui.Image image, List mask,
-      {double threshold = 0.5, bool smooth = true}) async {
-    final byteData = await image.toByteData(format: ui.ImageByteFormat.rawRgba);
-    if (byteData == null) throw Exception("Failed to get image ByteData");
-
-    final rgbaBytes = byteData.buffer.asUint8List();
-    final pixelCount = image.width * image.height;
-    final outRgbaBytes = Uint8List(4 * pixelCount);
-
-    // Apply smoothing if requested
-    List smoothedMask = mask;
-    if (smooth) {
-      smoothedMask = _smoothMask(mask, 3); // 3x3 blur kernel
-    }
-
-    for (int y = 0; y < image.height; y++) {
-      for (int x = 0; x < image.width; x++) {
-        final i = y * image.width + x;
-
-        // Apply threshold for binary decision with feathering
-        double maskValue = smoothedMask[y][x];
-        int alpha;
-
-        if (maskValue > threshold + 0.05) {
-          alpha = 255; // Full opacity for foreground
-        } else if (maskValue < threshold - 0.05) {
-          alpha = 0; // Full transparency for background
-        } else {
-          // Smooth transition in the boundary region
-          alpha = ((maskValue - (threshold - 0.05)) / 0.1 * 255)
-              .round()
-              .clamp(0, 255);
-        }
-
-        outRgbaBytes[i * 4] = rgbaBytes[i * 4]; // Red
-        outRgbaBytes[i * 4 + 1] = rgbaBytes[i * 4 + 1]; // Green
-        outRgbaBytes[i * 4 + 2] = rgbaBytes[i * 4 + 2]; // Blue
-        outRgbaBytes[i * 4 + 3] = alpha; // Alpha
-      }
-    }
-
-    final completer = Completer<ui.Image>();
-    ui.decodeImageFromPixels(
-        outRgbaBytes, image.width, image.height, ui.PixelFormat.rgba8888,
-        (ui.Image img) {
-      completer.complete(img);
-    });
-
-    return completer.future;
-  }
-
-  /// Helper method for mask smoothing using a box blur.
-  List _smoothMask(List mask, int kernelSize) {
-    final height = mask.length;
-    final width = mask[0].length;
-    final smoothed = List.generate(
-      height,
-      (_) => List.filled(width, 0.0),
-    );
-
-    final halfKernel = kernelSize ~/ 2;
-
-    for (int y = 0; y < height; y++) {
-      for (int x = 0; x < width; x++) {
-        double sum = 0.0;
-        int count = 0;
-
-        for (int ky = -halfKernel; ky <= halfKernel; ky++) {
-          for (int kx = -halfKernel; kx <= halfKernel; kx++) {
-            final ny = y + ky;
-            final nx = x + kx;
-
-            if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-              sum += mask[ny][nx];
-              count++;
-            }
-          }
-        }
-
-        smoothed[y][x] = sum / count;
-      }
-    }
-
-    return smoothed;
+    return byteData.buffer.asUint8List();
   }
 
   /// Adds a background color to the given image.
@@ -402,24 +226,16 @@ class BackgroundRemover {
   ///   - bgColor: The background color as a [Color].
   ///
   /// - Returns: A [Future] that completes with the modified image as a [Uint8List].
-  Future<Uint8List> addBackground(
-      {required Uint8List image, required Color bgColor}) async {
-    final img.Image decodedImage = img.decodeImage(image)!;
-    final newImage =
-        img.Image(width: decodedImage.width, height: decodedImage.height);
-    img.fill(newImage,
-        color: img.ColorRgb8(bgColor.red, bgColor.green, bgColor.blue));
-    img.compositeImage(newImage, decodedImage);
-    final jpegBytes = img.encodeJpg(newImage);
-    final completer = Completer<Uint8List>();
-    completer.complete(jpegBytes.buffer.asUint8List());
-    return completer.future;
+  Future<Uint8List> addBackground({
+    required Uint8List image,
+    required Color bgColor,
+  }) async {
+    return BackgroundComposer.addBackground(image: image, bgColor: bgColor);
   }
 
   /// Release resources
-  void dispose() {
-    _session?.release();
-    _session = null;
-    OrtEnv.instance.release();
+  /// Migration: Changed to async and use close() instead of release()
+  Future<void> dispose() async {
+    await _sessionManager.dispose();
   }
 }
